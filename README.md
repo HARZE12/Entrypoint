@@ -11,7 +11,6 @@ testing, red-team engagements and adversary simulation only**.
 ```
 entrypoint/
 ├── forge.py              # desktop GUI app (pure stdlib)
-├── offsec-setup.sh       # one-shot offensive tooling installer (Arch/Kali)
 ├── requirements.txt      # explains the zero pip deps + system packages
 ├── LICENSE               # MIT + authorized-use-only notice
 └── README.md
@@ -55,17 +54,45 @@ jitter (T1497.003). **x64** toggle picks the mingw cross-compiler arch.
 **Host personas** — built-in preset list of common host executables, grouped
 by architecture, so a patched build looks like a program users already trust.
 
+**Lab Detonator** — safe local test fire for a finished PE-embed build. The
+GUI detonation dialog launches the forged exe in a scratch copy and reports
+*stage executed* (illegal-instruction smoke stamp or an inbound TCP hit for
+connect payloads) vs *host ran clean* (the jump-back to the original entry
+point survived). No target contact: `ud2` mode proves the stage thread runs,
+`connect` mode just listens on your own LPORT.
+
+**Split-key delivery** — ship the build keyless: the `.entp` stage is armed
+with a random 16-byte key by a generated PowerShell script instead of at
+build time. The delivered exe stays inert (encrypted garbage, no key in
+file), and the PS script re-verifies the host image by SHA-256 before
+planting the key — a mismatched or tampered exe aborts untouched.
+
+**Stub variant rotation** — each build randomly selects one of 8 x64 / 16 x86
+byte-level variants of the entry stub (commutative-instruction swaps and
+mov encodings), capstone-verified equivalent, same length and signature.
+Same payload, different bytes every build; the chosen variant is recorded in
+`manifest.json` as `stub_variant`.
+
+**Execution gates** — optional dormancy checks evaluated *inside the target
+before the payload fires*: a date window (days since 1601 read straight from
+`KUSER_SHARED_DATA`, no APIs) and/or user / hostname needles matched
+case-insensitively against the live environment block. All gates pass → the
+stage runs; any gate fails → the thread exits and the host runs clean. Gate
+prologues are hand-assembled, API-free x64/x86 machine code prepended to the
+encrypted stage, so they travel through the same XOR layer as the payload.
+
 Every build lands in `~/.entrypoint/builds/EP-XXXXXX-<target>/` with
-`loader.c`, `build.sh`, `manifest.json` (keys, MITRE map, sizes) and, when a
-cross-compiler is on PATH, the finished binary. Each build re-rolls its key and
-identifiers — never ship the same file twice.
+`loader.c`, `build.sh`, `manifest.json` (keys, MITRE map, sizes, gates,
+stub variant) and, when a cross-compiler is on PATH, the finished binary.
+Each build re-rolls its key and identifiers — never ship the same file twice.
 
 ## Validation
 
 `python3 forge.py --selftest` runs an offline check suite — loader templates,
 crypto round-trips (XOR / RC4 / AES), PE-embed slot layout for both stub
-architectures, manifest and deliverable integrity — without needing msfvenom
-or a GUI.
+architectures, detonator plumbing, split-key arming, stub variant
+equivalence, execution-gate prologue layout and manifest/deliverable
+integrity — without needing msfvenom or a GUI (63 checks).
 
 The macOS loader is a C file you build with `clang -arch x86_64|arm64` (+ optional
 `codesign`); the Android output is a Java/JNI project assembled by its `build.sh`
